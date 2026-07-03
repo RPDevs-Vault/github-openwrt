@@ -1,0 +1,115 @@
+name: Build gh for OpenWrt
+
+on:
+  schedule:
+    # Check for new releases every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild even if version already exists'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Get latest cli/cli release tag
+        id: upstream
+        run: |
+          LATEST_TAG=$(curl -s https://api.github.com/repos/cli/cli/releases/latest | jq -r '.tag_name')
+          LATEST_VERSION="${LATEST_TAG#v}"
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream: $LATEST_TAG ($LATEST_VERSION)"
+
+      - name: Check if release already exists
+        id: check
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.upstream.outputs.tag }}")
+          if [ "$HTTP_CODE" = "200" ] && [ "${{ inputs.force_rebuild }}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.upstream.outputs.tag }} already exists, skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Building ${{ steps.upstream.outputs.tag }}..."
+          fi
+
+      - name: Clone cli/cli source
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          git clone --depth 1 --branch ${{ steps.upstream.outputs.tag }} https://github.com/cli/cli.git gh-src
+
+      - name: Setup Go
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: gh-src/go.mod
+
+      - name: Cross-compile for linux/arm64
+        if: steps.check.outputs.skip == 'false'
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          cd gh-src
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X github.com/cli/cli/v2/internal/build.Version=${{ steps.upstream.outputs.version }} \
+              -X github.com/cli/cli/v2/internal/build.Date=$(date +%Y-%m-%d)" \
+            -o ../gh-openwrt-arm64 \
+            ./cmd/gh
+          cd ..
+          ls -lh gh-openwrt-arm64
+          file gh-openwrt-arm64
+
+      - name: Compress with UPX
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl
+          cp gh-openwrt-arm64 gh-openwrt-arm64-uncompressed
+          upx --best --lzma gh-openwrt-arm64 || true
+          echo "=== Sizes ==="
+          ls -lh gh-openwrt-arm64 gh-openwrt-arm64-uncompressed
+
+      - name: Generate checksums
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          sha256sum gh-openwrt-arm64 > checksums.txt
+          sha256sum gh-openwrt-arm64-uncompressed >> checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.upstream.outputs.tag }}
+          name: "GitHub CLI ${{ steps.upstream.outputs.version }} for OpenWrt (aarch64)"
+          body: |
+            Cross-compiled from [cli/cli ${{ steps.upstream.outputs.tag }}](https://github.com/cli/cli/releases/tag/${{ steps.upstream.outputs.tag }}) for OpenWrt `aarch64_cortex-a53` (musl, static).
+
+            ## Files
+            - `gh-openwrt-arm64` — UPX-compressed binary (recommended)
+            - `gh-openwrt-arm64-uncompressed` — Full-size stripped binary
+
+            ## Install on OpenWrt
+            ```bash
+            wget -O /mnt/appdata/bin/gh <download-url-for-gh-openwrt-arm64-uncompressed>
+            chmod +x /mnt/appdata/bin/gh
+            ln -sf /mnt/appdata/bin/gh /usr/bin/gh
+            ```
+          files: |
+            gh-openwrt-arm64
+            gh-openwrt-arm64-uncompressed
+            checksums.txt
